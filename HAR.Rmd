@@ -1,0 +1,155 @@
+---
+title: "Human Activity Recognition"
+author: "Markus Friede Hens"
+date: "Tuesday, January 13, 2015"
+output: html_document
+---
+
+```{r, echo=FALSE}
+suppressPackageStartupMessages(require(caret))
+suppressPackageStartupMessages(require(e1071))
+suppressPackageStartupMessages(require(doParallel))
+```
+##Summary
+
+##Data Preparation
+First step is to load the data, and prepare it.
+```{r}
+pml_training <- read.csv("pml-training.csv", stringsAsFactors=FALSE)
+pml_testing <- read.csv("pml-testing.csv", stringsAsFactors=FALSE)
+```
+
+The data contains a lot of 'NA'-values, empty cells, as well as some error messages on division by zero (a value of `#DIV/0!`). So, first some basic clean-up needs to be done. Examining the problematic features, it shows that it is calculated features like Variance, Standard Deviation, Skewness, etc.
+All that information is captured in the raw measurement data anyway, and can be recalculated if needed for the prediction algorithm. Thus, I have decided to remove those features to clean the data. I also decided to remove some  columns like 'user_name' and the timestamps - predicting activity data should be generalized to any users and be independet on the time of day of the measurement taken. By removing the columns, any influence on the algorithm can be avoided.
+
+The remaining features in the data set are of two classes:
+* raw measurement data from gyrosscope, accelerometer, e.g. `gyros_belt_x`or `accel_arm_z`
+* features calculated from the raw data: pitch, yaw, roll (see an example of how those values are calculated [here](http://theccontinuum.com/2012/09/24/arduino-imu-pitch-roll-from-accelerometer/))
+
+For the classification problem that means, that I can limit myself to the calculated features, and remove the raw measurement values. That leaves me with a total of 16 features out of the original 159 to predict `classe`.
+
+```{r}
+cleanData <- function(data) { 
+  data <- data[, -(grep("kurtosis|skewness|max|min|amplitude|var_|avg_|stddev_", colnames(pml_training)))]
+  data <- data[,-(1:7)]
+  data <- data[,c(grep("roll|pitch|yaw|total", colnames(data)), 53)]
+  data
+} 
+
+cleanedData <- cleanData(pml_training)
+cleanedData$classe <- as.factor(cleanedData$classe)
+cleanedTestData <- cleanData(pml_testing)[,-17]
+```
+
+##Machine Learning Algorithm
+I split the data set into a training, a test and validation data set to have the possibility to combine predictors while having an independet data set for validation. The split gives 70% of the original data set as training data, 21% as test data and 9% for validation.
+
+```{r}
+set.seed(12345)
+inTrain <- createDataPartition(cleanedData$classe, p=0.7, list=FALSE)
+training <- cleanedData[inTrain,]
+testing <- cleanedData[-inTrain,]
+inTesting <- createDataPartition(testing$classe, p=0.7, list=FALSE)
+validation <- testing[-inTesting,]
+testing <- testing[inTesting,]
+```
+
+To make optimal use of the machine's ressources, I set up parallelization.
+```{r}
+cl <- makeCluster(detectCores())
+registerDoParallel(cl)
+```
+
+To get a first impression of the predictive power, I will run five different machine learning algorithms:
+GBM, SVM, Random Forests, CART and K-nearest neighbor.
+For a first try, I run them with a Repeated Cross Validation.
+
+```{r, cache=TRUE, echo=FALSE}
+fitControl <- trainControl(method="repeatedcv")
+modelGbm <- train(classe~., data=training, method="gbm", trControl=fitControl, verbose=FALSE)
+modelSvm <- svm(classe~., data=training)
+modelRf <- train(classe~., data=training, method="rf", trControl = fitControl)
+modelRpart2 <- train(classe~., data=training, method="rpart2", trControl=fitControl)
+modelKnn <- train(classe~., method="kknn", data=training, trControl=fitControl)
+```
+
+```
+fitControl <- trainControl(method="repeatedcv")
+modelGbm <- train(classe~., data=training, method="gbm", trControl=fitControl, verbose=FALSE)
+modelSvm <- svm(classe~., data=training)
+modelRf <- train(classe~., data=training, method="rf", trControl = fitControl)
+modelRpart2 <- train(classe~., data=training, method="rpart2", trControl=fitControl)
+modelKnn <- train(classe~., method="kknn", data=training, trControl=fitControl)
+```
+```{r, echo=FALSE}
+calcTestAccuracy <- function(prediction) sum(prediction == testing$classe)/length(prediction)
+
+predGbm <- predict(modelGbm, testing)
+predSvm <- predict(modelSvm, testing)
+predRf <- predict(modelRf, testing)
+predRpart2 <- predict(modelRpart2, testing)
+predKnn <- predict(modelKnn, testing)
+```
+
+The models shown the following performance on the testdata set:
+
+1. GBM: `r calcTestAccuracy(predGbm)`
+
+2. SVM: `r calcTestAccuracy(predSvm)`
+
+3. RF: `r calcTestAccuracy(predRf)`
+
+4. CART: `r calcTestAccuracy(predRpart2)`
+
+5. K-nn: `r calcTestAccuracy(predKnn)`
+
+The accuracy for the Random Forest is already >95%, even without further fine-tuning. As deriving the RF-model is very computing-intensive (and thus time-consuming), I will try combing the predictors first before looking into tuning the RF-model.
+
+```{r, echo=FALSE}
+predDF <- data.frame(gbm=predGbm, svm=predSvm, rf=predRf, rpart=predRpart2, knn=predKnn, classe=testing$classe)
+modelCombined <- train(classe~., data=predDF, method="rf", trControl = fitControl, proxy=TRUE)
+predCombined <- predict(modelCombined, predDF)
+```
+
+Applying the collected predictors on the *testdata set* gives me an accuracy  of **`r calcTestAccuracy(predCombined)`**
+
+```{r, echo=FALSE}
+pgbmv <- predict(modelGbm, validation)
+psvmv <- predict(modelSvm, validation)
+prfv <- predict(modelRf, validation)
+prpart2v <- predict(modelRpart2, validation)
+pknnv <- predict(modelKnn, validation)
+pv <- data.frame(gbm=pgbmv, svm=psvmv, rf=prfv, rpart=prpart2v, knn=pknnv)
+predv <- predict(modelCombined, pv)
+```
+
+Applying the collected predictors on the *validation set* gives me an accuracy of **`r sum(predv == validation$classe)/length(predv)`**.
+
+##Predicting the Project Testing Set (pml-testing)
+All that is left to do is apply the predictor to the `pml-testing`-data-set:
+```{r}
+tgbm <- predict(modelGbm, cleanedTestData)
+tsvm <- predict(modelSvm, cleanedTestData)
+trf <- predict(modelRf, cleanedTestData)
+tpart <- predict(modelRpart2, cleanedTestData)
+tknn <- predict(modelKnn, cleanedTestData)
+pt <- data.frame(gbm=tgbm, svm=tsvm, rf=trf, rpart=tpart, knn=tknn)
+finalPrediction <- predict(modelCombined, pt)
+```
+The final Prediction for the project's test data set is:
+`r finalPrediction`
+
+```{r, echo=FALSE}
+pml_write_files = function(x){
+  n = length(x)
+  for(i in 1:n){
+    filename = paste0("problem_id_",i,".txt")
+    write.table(x[i],file=filename,quote=FALSE,row.names=FALSE,col.names=FALSE)
+  }
+}
+
+pml_write_files(finalPrediction)
+```
+```{r}
+stopCluster(cl)
+```
